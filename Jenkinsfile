@@ -6,6 +6,10 @@ pipeline {
         IMAGE_BACKEND = "beacon-backend:latest"
     }
 
+    triggers {
+        githubPush()
+    }
+
     options {
         timestamps()
         disableConcurrentBuilds()

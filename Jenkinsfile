@@ -2,8 +2,9 @@ pipeline {
     agent any
 
     environment {
-        COMPOSE_PROJECT_NAME = "beacon"
-        // In a real scenario, JWT_SECRET should be a Jenkins Credential
+        APP_NAME = "beacon"
+        IMAGE_BACKEND = "beacon-backend:latest"
+        IMAGE_CLIENT = "beacon-client:latest"
         // JWT_SECRET = credentials('jwt-secret')
     }
 
@@ -17,51 +18,61 @@ pipeline {
             steps {
                 sh '''
                     echo "Current Directory: $(pwd)"
-                    echo "Files:"
+                    echo "Files in root:"
                     ls -la
+                    if [ -d "client" ]; then
+                        echo "Files in client:"
+                        ls -la client
+                    else
+                        echo "WARNING: 'client' directory not found!"
+                    fi
                     docker --version
-                    docker-compose version
                 '''
             }
         }
 
-        stage('Client Lint') {
-            when {
-                expression { fileExists('client/package.json') }
-            }
+        stage('Build & Deploy') {
             steps {
-                dir('client') {
-                    sh 'npm install && npm run lint || true'
-                }
-            }
-        }
-
-        stage('Backend Build Check') {
-            when {
-                expression { fileExists('package.json') }
-            }
-            steps {
-                sh 'npm install || true'
-            }
-        }
-
-        stage('Stop Old Containers') {
-            steps {
-                sh 'docker-compose down || true'
-            }
-        }
-
-        stage('Build Docker Images') {
-            steps {
-                // We pass VITE_API_BASE as a build arg if needed, 
-                // though it's already in docker-compose.yml
-                sh 'docker-compose build --no-cache'
-            }
-        }
-
-        stage('Start Stack') {
-            steps {
-                sh 'docker-compose up -d'
+                sh '''
+                    # Function to run docker-compose if available, else plain docker
+                    if command -v docker-compose >/dev/null 2>&1; then
+                        echo "Using docker-compose..."
+                        docker-compose down || true
+                        docker-compose build --no-cache
+                        docker-compose up -d
+                    elif docker compose version >/dev/null 2>&1; then
+                        echo "Using docker compose (V2)..."
+                        docker compose down || true
+                        docker compose build --no-cache
+                        docker compose up -d
+                    else
+                        echo "Compose not found. Using plain Docker commands..."
+                        
+                        # Stop existing containers if any
+                        docker stop beacon-backend beacon-client beacon-mongo || true
+                        docker rm beacon-backend beacon-client beacon-mongo || true
+                        
+                        # Start MongoDB
+                        docker run -d --name beacon-mongo -p 27017:27017 mongo:latest
+                        
+                        # Build and Start Backend
+                        docker build -t ${IMAGE_BACKEND} .
+                        docker run -d --name beacon-backend \
+                            -p 3000:3000 \
+                            --link beacon-mongo:mongodb \
+                            -e MONGODB_URI=mongodb://mongodb:27017/beacon \
+                            ${IMAGE_BACKEND}
+                            
+                        # Build and Start Client (if directory exists)
+                        if [ -d "client" ]; then
+                            docker build -t ${IMAGE_CLIENT} ./client
+                            docker run -d --name beacon-client \
+                                -p 8080:80 \
+                                --link beacon-backend:backend \
+                                ${IMAGE_CLIENT}
+                        fi
+                    fi
+                '''
             }
         }
 
@@ -74,23 +85,11 @@ pipeline {
                 '''
             }
         }
-
-        stage('Cleanup') {
-            steps {
-                sh 'docker image prune -f'
-            }
-        }
     }
 
     post {
-        success {
-            echo 'Deployment completed successfully.'
-        }
-        failure {
-            echo 'Pipeline failed. Check the logs.'
-        }
         always {
-            sh 'docker-compose ps'
+            sh 'docker ps'
         }
     }
 }

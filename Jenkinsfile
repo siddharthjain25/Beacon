@@ -20,7 +20,7 @@ pipeline {
                     echo "Files:"
                     ls -la
                     docker --version
-                    docker compose version
+                    docker-compose version
                 '''
             }
         }
@@ -47,7 +47,7 @@ pipeline {
 
         stage('Stop Old Containers') {
             steps {
-                sh 'docker compose down || true'
+                sh 'docker-compose down || true'
             }
         }
 
@@ -55,13 +55,13 @@ pipeline {
             steps {
                 // We pass VITE_API_BASE as a build arg if needed, 
                 // though it's already in docker-compose.yml
-                sh 'docker compose build --no-cache'
+                sh 'docker-compose build --no-cache'
             }
         }
 
         stage('Start Stack') {
             steps {
-                sh 'docker compose up -d'
+                sh 'docker-compose up -d'
             }
         }
 
@@ -90,7 +90,7 @@ pipeline {
             echo 'Pipeline failed. Check the logs.'
         }
         always {
-            sh 'docker compose ps'
+            sh 'docker-compose ps'
         }
     }
 }

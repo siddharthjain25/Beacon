@@ -1,7 +1,10 @@
 import broker from './broker.js';
-import Message from './models/Message.js';
 import User from './models/User.js';
-import Topic from './models/Topic.js';
+import { pool } from './db.js';
+import { queueWebhookDispatch } from './webhooks.js';
+import Ajv from 'ajv';
+
+const ajv = new Ajv();
 
 /**
  * Fastify plugin defining the notification routes.
@@ -14,26 +17,40 @@ export default async function (fastify) {
   const getTopicWithAccess = async (username, topicName, request, reply) => {
     const user = await User.findOne({ username });
     if (!user) {
-      reply.status(404).send({ error: 'User not found' });
+      if (reply) reply.status(404).send({ error: 'User not found' });
       return null;
     }
 
-    const topic = await Topic.findOne({ name: topicName, owner: user._id });
+    const { rows } = await pool.query(
+      'SELECT id, name, owner_id AS "owner", is_private AS "isPrivate", description, webhooks, payload_schema AS "payloadSchema", authorized_users AS "authorizedUsers" FROM topics WHERE name = $1 AND owner_id = $2',
+      [topicName, user._id.toString()]
+    );
+    const topic = rows[0];
     if (!topic) {
-      reply.status(404).send({ error: 'Topic not found' });
+      if (reply) reply.status(404).send({ error: 'Topic not found' });
       return null;
     }
+    
+    // Map id to _id for frontend compatibility
+    topic._id = topic.id;
 
     if (topic.isPrivate) {
       // Authenticate using the common decorator (handles JWT and API Keys)
       if (!request.user) {
+        if (!reply) {
+          throw new Error('Authentication required but reply object is missing');
+        }
         await fastify.authenticate(request, reply);
       }
       
-      if (reply.sent) return null;
+      if (reply && reply.sent) return null;
 
-      if (request.user.id !== user._id.toString()) {
-        reply.status(403).send({ error: 'Access denied to private topic' });
+      const isOwner = request.user.id === user._id.toString();
+      const isAuthorized = topic.authorizedUsers ? topic.authorizedUsers.some(uId => uId === request.user.id) : false;
+      const isTopicKeyAuth = request.user.topicAuth && request.user.topicAuth.topicId === topic.id;
+
+      if (!isOwner && !isAuthorized && !isTopicKeyAuth) {
+        if (reply) reply.status(403).send({ error: 'Access denied to private topic' });
         return null;
       }
     }
@@ -46,17 +63,25 @@ export default async function (fastify) {
    * POST /api/topics
    */
   fastify.post('/api/topics', { preHandler: [fastify.authenticate] }, async (request, reply) => {
-    const { name, isPrivate } = request.body;
+    const { name, isPrivate, description } = request.body;
     const owner = request.user.id;
 
     try {
-      const existingTopic = await Topic.findOne({ name, owner });
-      if (existingTopic) {
+      const { rows: existingRows } = await pool.query(
+        'SELECT id FROM topics WHERE name = $1 AND owner_id = $2',
+        [name, owner]
+      );
+      if (existingRows.length > 0) {
         return reply.status(400).send({ error: 'Topic already exists for this user' });
       }
 
-      const topic = new Topic({ name, owner, isPrivate });
-      await topic.save();
+      const { rows } = await pool.query(
+        'INSERT INTO topics (name, owner_id, is_private, description) VALUES ($1, $2, $3, $4) RETURNING id, name, owner_id AS "owner", is_private AS "isPrivate", description, webhooks, payload_schema AS "payloadSchema", authorized_users AS "authorizedUsers", created_at AS "createdAt"',
+        [name, owner, isPrivate || false, description || '']
+      );
+
+      const topic = rows[0];
+      if (topic) topic._id = topic.id;
 
       return topic;
     } catch (err) {
@@ -71,7 +96,20 @@ export default async function (fastify) {
    */
   fastify.get('/api/my-topics', { preHandler: [fastify.authenticate] }, async (request, reply) => {
     try {
-      const topics = await Topic.find({ owner: request.user.id }).sort({ createdAt: -1 });
+      const { rows } = await pool.query(
+        'SELECT id, name, owner_id AS "owner", is_private AS "isPrivate", description, webhooks, payload_schema AS "payloadSchema", authorized_users AS "authorizedUsers", created_at AS "createdAt" FROM topics WHERE owner_id = $1 ORDER BY created_at DESC',
+        [request.user.id]
+      );
+
+      const topics = rows.map(t => ({
+        ...t,
+        _id: t.id,
+        owner: {
+          _id: request.user.id,
+          username: request.user.username
+        }
+      }));
+
       return topics;
     } catch (err) {
       fastify.log.error(err);
@@ -80,24 +118,73 @@ export default async function (fastify) {
   });
 
   /**
-   * Toggle topic privacy
-   * PATCH /api/topics/:id/toggle-privacy
+   * Update topic settings
+   * PATCH /api/topics/:id
    */
-  fastify.patch('/api/topics/:id/toggle-privacy', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  fastify.patch('/api/topics/:id', { preHandler: [fastify.authenticate] }, async (request, reply) => {
     const { id } = request.params;
+    const updates = request.body;
+    
+    // Only allow specific fields to be updated
+    const allowedUpdates = ['isPrivate', 'description', 'webhooks', 'payloadSchema'];
+    const actualUpdates = {};
+    
+    Object.keys(updates).forEach(key => {
+      if (allowedUpdates.includes(key)) {
+        actualUpdates[key] = updates[key];
+      }
+    });
+
+    if (Object.keys(actualUpdates).length === 0) {
+      return reply.status(400).send({ error: 'No valid updates provided' });
+    }
+
     try {
-      const topic = await Topic.findOne({ _id: id, owner: request.user.id });
+      const setClauses = [];
+      const values = [];
+      let paramIndex = 1;
+
+      // Map js camelCase fields to postgres snake_case fields
+      const fieldMapping = {
+        isPrivate: 'is_private',
+        description: 'description',
+        webhooks: 'webhooks',
+        payloadSchema: 'payload_schema'
+      };
+
+      for (const [key, value] of Object.entries(actualUpdates)) {
+        const dbField = fieldMapping[key];
+        setClauses.push(`${dbField} = $${paramIndex}`);
+        values.push(value);
+        paramIndex++;
+      }
+
+      // Add id and owner_id parameters
+      values.push(id, request.user.id);
+      const query = `
+        UPDATE topics 
+        SET ${setClauses.join(', ')} 
+        WHERE id = $${paramIndex} AND owner_id = $${paramIndex + 1}
+        RETURNING id, name, owner_id AS "owner", is_private AS "isPrivate", description, webhooks, payload_schema AS "payloadSchema", authorized_users AS "authorizedUsers", created_at AS "createdAt"
+      `;
+
+      const { rows } = await pool.query(query, values);
+      const topic = rows[0];
+      
       if (!topic) {
         return reply.status(404).send({ error: 'Topic not found or access denied' });
       }
-      
-      topic.isPrivate = !topic.isPrivate;
-      await topic.save();
+
+      topic._id = topic.id;
+      topic.owner = {
+        _id: request.user.id,
+        username: request.user.username
+      };
       
       return topic;
     } catch (err) {
       fastify.log.error(err);
-      return reply.status(500).send({ error: 'Failed to toggle privacy' });
+      return reply.status(500).send({ error: 'Failed to update topic' });
     }
   });
 
@@ -108,21 +195,193 @@ export default async function (fastify) {
   fastify.delete('/api/topics/:id', { preHandler: [fastify.authenticate] }, async (request, reply) => {
     const { id } = request.params;
     try {
-      const topic = await Topic.findOne({ _id: id, owner: request.user.id });
-      if (!topic) {
+      const { rowCount } = await pool.query(
+        'DELETE FROM topics WHERE id = $1 AND owner_id = $2',
+        [id, request.user.id]
+      );
+      
+      if (rowCount === 0) {
         return reply.status(404).send({ error: 'Topic not found or access denied' });
       }
-      
-      // Delete all messages associated with this topic
-      await Message.deleteMany({ topic: id });
-      
-      // Delete the topic itself
-      await Topic.deleteOne({ _id: id });
       
       return { status: 'ok', message: 'Topic and its messages deleted' };
     } catch (err) {
       fastify.log.error(err);
       return reply.status(500).send({ error: 'Failed to delete topic' });
+    }
+  });
+
+  /**
+   * Create a new topic API key
+   * POST /api/topics/:id/keys
+   */
+  fastify.post('/api/topics/:id/keys', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+    const { id } = request.params;
+    const { name, permission } = request.body;
+    
+    if (!name || !permission) {
+      return reply.status(400).send({ error: 'Name and permission are required' });
+    }
+
+    try {
+      // Verify topic ownership
+      const { rows: topicRows } = await pool.query(
+        'SELECT id FROM topics WHERE id = $1 AND owner_id = $2',
+        [id, request.user.id]
+      );
+      if (topicRows.length === 0) {
+        return reply.status(404).send({ error: 'Topic not found or access denied' });
+      }
+
+      const { nanoid } = await import('nanoid');
+      const keyValue = `bt_${nanoid(32)}`;
+
+      const { rows } = await pool.query(
+        'INSERT INTO topic_api_keys (topic_id, name, key_value, permission) VALUES ($1, $2, $3, $4) RETURNING id, name, key_value AS "keyValue", permission, created_at AS "createdAt"',
+        [id, name, keyValue, permission]
+      );
+
+      return rows[0];
+    } catch (err) {
+      fastify.log.error(err);
+      return reply.status(500).send({ error: 'Failed to create topic key' });
+    }
+  });
+
+  /**
+   * Get all API keys for a topic
+   * GET /api/topics/:id/keys
+   */
+  fastify.get('/api/topics/:id/keys', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+    const { id } = request.params;
+
+    try {
+      // Verify topic ownership
+      const { rows: topicRows } = await pool.query(
+        'SELECT id FROM topics WHERE id = $1 AND owner_id = $2',
+        [id, request.user.id]
+      );
+      if (topicRows.length === 0) {
+        return reply.status(404).send({ error: 'Topic not found or access denied' });
+      }
+
+      const { rows } = await pool.query(
+        'SELECT id, name, key_value AS "keyValue", permission, created_at AS "createdAt" FROM topic_api_keys WHERE topic_id = $1 ORDER BY created_at DESC',
+        [id]
+      );
+
+      // Mask key value except for first and last few characters for security
+      const maskedKeys = rows.map(k => ({
+        ...k,
+        keyValue: `${k.keyValue.slice(0, 7)}...${k.keyValue.slice(-4)}`
+      }));
+
+      return maskedKeys;
+    } catch (err) {
+      fastify.log.error(err);
+      return reply.status(500).send({ error: 'Failed to fetch topic keys' });
+    }
+  });
+
+  /**
+   * Delete a topic API key
+   * DELETE /api/topics/:id/keys/:keyId
+   */
+  fastify.delete('/api/topics/:id/keys/:keyId', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+    const { id, keyId } = request.params;
+
+    try {
+      // Verify topic ownership
+      const { rows: topicRows } = await pool.query(
+        'SELECT id FROM topics WHERE id = $1 AND owner_id = $2',
+        [id, request.user.id]
+      );
+      if (topicRows.length === 0) {
+        return reply.status(404).send({ error: 'Topic not found or access denied' });
+      }
+
+      const { rowCount } = await pool.query(
+        'DELETE FROM topic_api_keys WHERE id = $1 AND topic_id = $2',
+        [keyId, id]
+      );
+
+      if (rowCount === 0) {
+        return reply.status(404).send({ error: 'Key not found' });
+      }
+
+      return { status: 'ok', message: 'Topic API key deleted' };
+    } catch (err) {
+      fastify.log.error(err);
+      return reply.status(500).send({ error: 'Failed to delete topic key' });
+    }
+  });
+
+  /**
+   * Subscriber endpoint (WebSocket)
+   * GET /ws/:username/:topic
+   */
+  fastify.get('/ws/:username/:topic', { 
+    websocket: true,
+    preHandler: async (request, reply) => {
+      const { username, topic: topicName } = request.params;
+      const topic = await getTopicWithAccess(username, topicName, request, reply);
+      if (!topic) return;
+      request.topic = topic;
+    }
+  }, async (connection, request) => {
+    const { username, topic: topicName } = request.params;
+    
+    const topic = request.topic;
+    if (!topic) {
+      connection.socket.close();
+      return;
+    }
+
+    const brokerTopic = `${username}/${topicName}`;
+    const listener = (data) => {
+      connection.socket.send(typeof data === 'string' ? data : JSON.stringify(data));
+    };
+
+    broker.on(brokerTopic, listener);
+    fastify.log.info(`WS Subscriber connected to topic: ${brokerTopic}`);
+
+    connection.socket.on('close', () => {
+      broker.removeListener(brokerTopic, listener);
+      fastify.log.info(`WS Subscriber disconnected from topic: ${brokerTopic}`);
+    });
+  });
+
+  /**
+   * Topics discovery endpoint
+   * GET /api/topics
+   */
+  fastify.get('/api/topics', async (request, reply) => {
+    try {
+      // Only return public topics
+      const { rows } = await pool.query(
+        'SELECT id, name, owner_id AS "owner", is_private AS "isPrivate", description, webhooks, payload_schema AS "payloadSchema", authorized_users AS "authorizedUsers", created_at AS "createdAt" FROM topics WHERE is_private = false'
+      );
+
+      // Get unique owner IDs
+      const ownerIds = [...new Set(rows.map(t => t.owner))];
+
+      // Fetch users from MongoDB
+      const users = await User.find({ _id: { $in: ownerIds } }).select('username').lean();
+      const userMap = users.reduce((acc, u) => {
+        acc[u._id.toString()] = { _id: u._id.toString(), username: u.username };
+        return acc;
+      }, {});
+
+      const topics = rows.map(t => ({
+        ...t,
+        _id: t.id,
+        owner: userMap[t.owner] || { _id: t.owner, username: 'unknown' }
+      }));
+
+      return { topics };
+    } catch (err) {
+      fastify.log.error(err);
+      return reply.status(500).send({ error: 'Failed to fetch topics' });
     }
   });
 
@@ -168,6 +427,8 @@ export default async function (fastify) {
       broker.removeListener(brokerTopic, listener);
       fastify.log.info(`SSE Subscriber disconnected from topic: ${brokerTopic}`);
     });
+
+    return reply;
   });
 
   /**
@@ -181,11 +442,12 @@ export default async function (fastify) {
     if (!topic) return;
 
     try {
-      const messages = await Message.find({ topic: topic._id })
-        .sort({ createdAt: -1 })
-        .limit(50);
+      const { rows } = await pool.query(
+        'SELECT id, topic_id AS "topic", payload, created_at AS "createdAt" FROM messages WHERE topic_id = $1 ORDER BY created_at DESC LIMIT 50',
+        [topic.id]
+      );
       
-      return messages.reverse();
+      return rows.reverse();
     } catch (err) {
       fastify.log.error(err);
       return reply.status(500).send({ error: 'Failed to fetch history' });
@@ -193,54 +455,227 @@ export default async function (fastify) {
   });
 
   /**
-   * Topics discovery endpoint
-   * GET /api/topics
-   */
-  fastify.get('/api/topics', async (request, reply) => {
-    try {
-      // Only return public topics
-      const topics = await Topic.find({ isPrivate: false }).populate('owner', 'username');
-      return { topics };
-    } catch (err) {
-      fastify.log.error(err);
-      return reply.status(500).send({ error: 'Failed to fetch topics' });
-    }
-  });
-
-  /**
    * Publisher endpoint
    * POST /:username/:topic
    */
-  fastify.post('/:username/:topic', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  fastify.post('/:username/:topic', async (request, reply) => {
     const { username, topic: topicName } = request.params;
     const payload = request.body;
 
     const user = await User.findOne({ username });
-    if (!user || request.user.id !== user._id.toString()) {
-      return reply.status(403).send({ error: 'Only the topic owner can publish' });
+    if (!user) {
+      return reply.status(404).send({ error: 'User not found' });
     }
 
-    const topic = await Topic.findOne({ name: topicName, owner: user._id });
+    // Try to authenticate if auth credentials are provided
+    if (request.headers.authorization || request.query.token || request.query.apiKey) {
+      try {
+        await request.jwtVerify();
+      } catch (_) {
+        // If JWT fails, check for API key
+        const authHeader = request.headers.authorization;
+        let apiKey = request.query.token || request.query.apiKey;
+
+        if (authHeader && authHeader.startsWith('Bearer ')) {
+          const potentialKey = authHeader.split(' ')[1];
+          if (potentialKey.startsWith('bc_') || potentialKey.startsWith('bt_')) {
+            apiKey = potentialKey;
+          }
+        }
+
+        if (apiKey) {
+          if (apiKey.startsWith('bc_')) {
+            const dbUser = await User.findOne({ apiKey });
+            if (dbUser) {
+              request.user = { id: dbUser._id.toString(), username: dbUser.username };
+            }
+          } else if (apiKey.startsWith('bt_')) {
+            const { rows } = await pool.query(
+              `SELECT tk.id, tk.permission, t.id AS topic_id
+               FROM topic_api_keys tk
+               JOIN topics t ON tk.topic_id = t.id
+               WHERE tk.key_value = $1 AND t.name = $2 AND t.owner_id = $3`,
+              [apiKey, topicName, user._id.toString()]
+            );
+            const keyInfo = rows[0];
+            if (keyInfo) {
+              const isAllowed = keyInfo.permission === 'all' || keyInfo.permission === 'publish';
+              if (isAllowed) {
+                request.user = { 
+                  id: user._id.toString(), 
+                  username: user.username,
+                  topicAuth: {
+                    topicId: keyInfo.topic_id,
+                    permission: keyInfo.permission
+                  }
+                };
+              }
+            }
+          }
+        }
+      }
+    }
+
+    let { rows } = await pool.query(
+      'SELECT id, name, owner_id AS "owner", is_private AS "isPrivate", description, webhooks, payload_schema AS "payloadSchema", authorized_users AS "authorizedUsers" FROM topics WHERE name = $1 AND owner_id = $2',
+      [topicName, user._id.toString()]
+    );
+    let topic = rows[0];
+
+    // Auto-create topic if it does not exist, but only if request is authenticated as owner
     if (!topic) {
-      return reply.status(404).send({ error: 'Topic not found' });
+      const isOwner = request.user && request.user.id === user._id.toString() && !request.user.topicAuth;
+      if (isOwner) {
+        try {
+          const { rows: newTopicRows } = await pool.query(
+            'INSERT INTO topics (name, owner_id, is_private, description) VALUES ($1, $2, $3, $4) RETURNING id, name, owner_id AS "owner", is_private AS "isPrivate", description, webhooks, payload_schema AS "payloadSchema", authorized_users AS "authorizedUsers"',
+            [topicName, user._id.toString(), true, 'Automatically provisioned endpoint']
+          );
+          topic = newTopicRows[0];
+          fastify.log.info(`Topic /${username}/${topicName} automatically provisioned.`);
+        } catch (err) {
+          fastify.log.error(err);
+          return reply.status(500).send({ error: 'Failed to auto-create topic' });
+        }
+      } else {
+        return reply.status(404).send({ error: 'Topic not found' });
+      }
+    }
+
+    // Check if the requester is authorized only if the topic is private
+    if (topic.isPrivate) {
+      if (!request.user) {
+        await fastify.authenticate(request, reply);
+      }
+      if (reply.sent) return;
+
+      const isOwner = request.user.id === user._id.toString();
+      const isAuthorized = topic.authorizedUsers ? topic.authorizedUsers.some(uId => uId === request.user.id) : false;
+      const isTopicKeyAuth = request.user.topicAuth && request.user.topicAuth.topicId === topic.id;
+
+      if (!isOwner && !isAuthorized && !isTopicKeyAuth) {
+        return reply.status(403).send({ error: 'Only the topic owner or authorized users can publish' });
+      }
+    }
+
+    // Payload Validation
+    if (topic.payloadSchema) {
+      const validate = ajv.compile(topic.payloadSchema);
+      const valid = validate(payload);
+      if (!valid) {
+        return reply.status(400).send({ 
+          error: 'Payload does not match topic schema', 
+          details: validate.errors 
+        });
+      }
     }
 
     try {
       // Save message to database
-      const newMessage = new Message({
-        topic: topic._id,
-        payload,
-      });
-      await newMessage.save();
+      const { rows } = await pool.query(
+        'INSERT INTO messages (topic_id, payload) VALUES ($1, $2) RETURNING id',
+        [topic.id, JSON.stringify(payload)]
+      );
+      const messageId = rows[0].id;
 
       // Emit the message to the broker for real-time subscribers
       const brokerTopic = `${username}/${topicName}`;
       broker.emit(brokerTopic, payload);
 
+      // Dispatch Webhooks
+      queueWebhookDispatch(topic, messageId, payload);
+
       return { status: 'ok', topic: topicName, message: 'Notification sent and saved' };
     } catch (err) {
       fastify.log.error(err);
       return reply.status(500).send({ error: 'Failed to process notification' });
+    }
+  });
+
+  /**
+   * Analytics endpoint
+   * GET /api/analytics/:topicId
+   */
+  fastify.get('/api/analytics/:topicId', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+    const { topicId } = request.params;
+    
+    try {
+      const { rows: topicRows } = await pool.query(
+        'SELECT id FROM topics WHERE id = $1 AND owner_id = $2',
+        [topicId, request.user.id]
+      );
+      const topic = topicRows[0];
+      if (!topic) {
+        return reply.status(404).send({ error: 'Topic not found or access denied' });
+      }
+
+      const { rows: totalRows } = await pool.query(
+        'SELECT COUNT(*)::int AS count FROM messages WHERE topic_id = $1',
+        [topic.id]
+      );
+      const totalMessages = totalRows[0].count;
+      
+      // Last 24 hours
+      const last24h = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      const { rows: last24hRows } = await pool.query(
+        'SELECT COUNT(*)::int AS count FROM messages WHERE topic_id = $1 AND created_at >= $2',
+        [topic.id, last24h]
+      );
+      const messagesLast24h = last24hRows[0].count;
+
+      // Group by day for the last 7 days
+      const last7d = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      const { rows: dailyRows } = await pool.query(
+        `SELECT TO_CHAR(created_at, 'YYYY-MM-DD') AS _id, COUNT(*)::int AS count 
+         FROM messages 
+         WHERE topic_id = $1 AND created_at >= $2 
+         GROUP BY TO_CHAR(created_at, 'YYYY-MM-DD') 
+         ORDER BY _id ASC`,
+        [topic.id, last7d]
+      );
+
+      return {
+        totalMessages,
+        messagesLast24h,
+        dailyStats: dailyRows
+      };
+    } catch (err) {
+      fastify.log.error(err);
+      return reply.status(500).send({ error: 'Failed to fetch analytics' });
+    }
+  });
+
+  /**
+   * Get webhook logs for a topic
+   * GET /api/topics/:id/webhook-logs
+   */
+  fastify.get('/api/topics/:id/webhook-logs', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+    const { id } = request.params;
+    try {
+      // Check if topic exists and is owned by request.user.id
+      const { rows: topicRows } = await pool.query(
+        'SELECT id FROM topics WHERE id = $1 AND owner_id = $2',
+        [id, request.user.id]
+      );
+      const topic = topicRows[0];
+      if (!topic) {
+        return reply.status(404).send({ error: 'Topic not found or access denied' });
+      }
+
+      // Fetch last 50 webhook logs
+      const { rows: logs } = await pool.query(
+        `SELECT id, message_id AS "messageId", url, status_code AS "statusCode", request_payload AS "requestPayload", response_payload AS "responsePayload", duration_ms AS "durationMs", success, error_message AS "errorMessage", attempts, created_at AS "createdAt"
+         FROM webhook_logs 
+         WHERE topic_id = $1 
+         ORDER BY created_at DESC 
+         LIMIT 50`,
+        [topic.id]
+      );
+
+      return logs;
+    } catch (err) {
+      fastify.log.error(err);
+      return reply.status(500).send({ error: 'Failed to fetch webhook logs' });
     }
   });
 }

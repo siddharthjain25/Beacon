@@ -66,6 +66,7 @@ fastify.addContentTypeParser('*', { parseAs: 'string' }, (request, payload, done
     const json = JSON.parse(payload);
     return done(null, json);
   } catch (err) {
+    request.log.debug(`Wildcard parser: payload is not valid JSON: ${err.message}`);
     // Check if it looks like URL-encoded form data (e.g., key1=value1&key2=value2)
     if (payload.includes('=') && !payload.includes('{') && !payload.includes('[')) {
       try {
@@ -76,7 +77,7 @@ fastify.addContentTypeParser('*', { parseAs: 'string' }, (request, payload, done
         }
         return done(null, obj);
       } catch (e) {
-        // ignore and fallback
+        request.log.debug(`Wildcard parser: payload is not valid URLSearchParams: ${e.message}`);
       }
     }
     return done(null, payload);
@@ -198,19 +199,29 @@ fastify.get('/', async (request, reply) => {
 fastify.register(authRoutes, { prefix: '/api/auth' });
 fastify.register(routes);
 
+let isInitialized = false;
+
+const initServer = async () => {
+  if (isInitialized) return;
+
+  // Connect to MongoDB
+  const mongoUri = process.env.MONGODB_URI || 'mongodb://localhost:27017/beacon';
+  await mongoose.connect(mongoUri);
+  fastify.log.info('Connected to MongoDB');
+
+  // Connect and initialize Postgres
+  await initDb();
+  fastify.log.info('Connected and initialized PostgreSQL');
+
+  isInitialized = true;
+};
+
 /**
  * Run the server!
  */
 const start = async () => {
   try {
-    // Connect to MongoDB
-    const mongoUri = process.env.MONGODB_URI || 'mongodb://localhost:27017/beacon';
-    await mongoose.connect(mongoUri);
-    fastify.log.info('Connected to MongoDB');
-
-    // Connect and initialize Postgres
-    await initDb();
-    fastify.log.info('Connected and initialized PostgreSQL');
+    await initServer();
 
     const port = process.env.PORT || 3000;
     await fastify.listen({ port: Number.parseInt(port, 10), host: '0.0.0.0' });
@@ -221,9 +232,24 @@ const start = async () => {
   }
 };
 
-try {
-  await start();
-} catch (err) {
-  console.error('💥 FAILED TO START SERVER:', err);
-  process.exit(1);
+// Export the Vercel serverless function handler
+export default async (req, res) => {
+  try {
+    await initServer();
+    await fastify.ready();
+    fastify.server.emit('request', req, res);
+  } catch (err) {
+    console.error('💥 Vercel handler initialization failed:', err);
+    res.statusCode = 500;
+    res.end(JSON.stringify({ error: 'Internal Server Error', message: err.message }));
+  }
+};
+
+if (!process.env.VERCEL) {
+  try {
+    await start();
+  } catch (err) {
+    console.error('💥 FAILED TO START SERVER:', err);
+    process.exit(1);
+  }
 }

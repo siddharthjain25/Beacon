@@ -17,6 +17,35 @@ const fastify = Fastify({
   logger: true,
 });
 
+// Remove default text/plain parser so it falls back to the wildcard * parser
+fastify.removeContentTypeParser('text/plain');
+
+// Register a wildcard content-type parser to handle all unsupported and missing media types
+fastify.addContentTypeParser('*', { parseAs: 'string' }, (request, payload, done) => {
+  if (!payload) {
+    return done(null, payload);
+  }
+  try {
+    const json = JSON.parse(payload);
+    return done(null, json);
+  } catch (err) {
+    // Check if it looks like URL-encoded form data (e.g., key1=value1&key2=value2)
+    if (payload.includes('=') && !payload.includes('{') && !payload.includes('[')) {
+      try {
+        const params = new URLSearchParams(payload);
+        const obj = {};
+        for (const [key, value] of params.entries()) {
+          obj[key] = value;
+        }
+        return done(null, obj);
+      } catch (e) {
+        // ignore and fallback
+      }
+    }
+    return done(null, payload);
+  }
+});
+
 // Register Rate Limit
 await fastify.register(rateLimit, {
   max: 100,

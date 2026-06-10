@@ -5,7 +5,7 @@ import { nanoid } from 'nanoid';
  * Fastify plugin defining the authentication routes.
  * @param {import('fastify').FastifyInstance} fastify
  */
-export default async function (fastify) {
+export default async function authRoutes(fastify) {
   /**
    * Register a new user
    * POST /api/auth/register

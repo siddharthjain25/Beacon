@@ -5,7 +5,7 @@ dotenv.config();
 
 const { Pool } = pg;
 
-const connectionString = process.env.POSTGRES_URI || 'postgresql://beacon:beaconpassword@localhost:5432/beacon';
+const connectionString = process.env.POSTGRES_URI || 'postgresql://localhost:5432/beacon';
 
 export const pool = new Pool({
   connectionString,

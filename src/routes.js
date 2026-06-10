@@ -3,14 +3,83 @@ import User from './models/User.js';
 import { pool } from './db.js';
 import { queueWebhookDispatch } from './webhooks.js';
 import Ajv from 'ajv';
+import { nanoid } from 'nanoid';
 
 const ajv = new Ajv();
+const validatorsCache = new Map();
+
+function getValidator(schema) {
+  const schemaStr = JSON.stringify(schema);
+  let validate = validatorsCache.get(schemaStr);
+  if (!validate) {
+    validate = ajv.compile(schema);
+    // Maintain a maximum cache size of 1000 to prevent memory exhaustion
+    if (validatorsCache.size > 1000) {
+      const firstKey = validatorsCache.keys().next().value;
+      validatorsCache.delete(firstKey);
+    }
+    validatorsCache.set(schemaStr, validate);
+  }
+  return validate;
+}
+
+const extractApiKey = (request) => {
+  const potentialKey = request.headers?.authorization?.split(' ')[1];
+  if (potentialKey?.startsWith('bc_') || potentialKey?.startsWith('bt_')) {
+    return potentialKey;
+  }
+  return request.query?.token || request.query?.apiKey;
+};
+
+const verifyTopicKeyForPublish = async (apiKey, topicName, ownerId) => {
+  const { rows } = await pool.query(
+    `SELECT tk.id, tk.permission, t.id AS topic_id
+     FROM topic_api_keys tk
+     JOIN topics t ON tk.topic_id = t.id
+     WHERE tk.key_value = $1 AND t.name = $2 AND t.owner_id = $3`,
+    [apiKey, topicName, ownerId]
+  );
+  const keyInfo = rows[0];
+  if (!keyInfo) return null;
+
+  const isAllowed = keyInfo.permission === 'all' || keyInfo.permission === 'publish';
+  if (!isAllowed) return null;
+
+  return {
+    topicId: keyInfo.topic_id,
+    permission: keyInfo.permission
+  };
+};
 
 /**
  * Fastify plugin defining the notification routes.
  * @param {import('fastify').FastifyInstance} fastify
  */
-export default async function (fastify) {
+export default async function beaconRoutes(fastify) {
+  /**
+   * Helper to find topic and check access
+   */
+  const checkPrivateAccess = async (topic, request, reply, ownerId, errorMessage = 'Access denied to private topic') => {
+    if (!request.user) {
+      if (!reply) {
+        throw new Error('Authentication required but reply object is missing');
+      }
+      await fastify.authenticate(request, reply);
+    }
+    
+    if (reply?.sent) return false;
+
+    const isOwner = request.user.id === ownerId;
+    const isAuthorized = topic.authorizedUsers?.includes(request.user.id) ?? false;
+    const isTopicKeyAuth = request.user.topicAuth?.topicId === topic.id;
+
+    if (!isOwner && !isAuthorized && !isTopicKeyAuth) {
+      if (reply) reply.status(403).send({ error: errorMessage });
+      return false;
+    }
+    return true;
+  };
+
   /**
    * Helper to find topic and check access
    */
@@ -35,24 +104,8 @@ export default async function (fastify) {
     topic._id = topic.id;
 
     if (topic.isPrivate) {
-      // Authenticate using the common decorator (handles JWT and API Keys)
-      if (!request.user) {
-        if (!reply) {
-          throw new Error('Authentication required but reply object is missing');
-        }
-        await fastify.authenticate(request, reply);
-      }
-      
-      if (reply && reply.sent) return null;
-
-      const isOwner = request.user.id === user._id.toString();
-      const isAuthorized = topic.authorizedUsers ? topic.authorizedUsers.some(uId => uId === request.user.id) : false;
-      const isTopicKeyAuth = request.user.topicAuth && request.user.topicAuth.topicId === topic.id;
-
-      if (!isOwner && !isAuthorized && !isTopicKeyAuth) {
-        if (reply) reply.status(403).send({ error: 'Access denied to private topic' });
-        return null;
-      }
+      const hasAccess = await checkPrivateAccess(topic, request, reply, user._id.toString());
+      if (!hasAccess) return null;
     }
 
     return topic;
@@ -126,11 +179,11 @@ export default async function (fastify) {
     const updates = request.body;
     
     // Only allow specific fields to be updated
-    const allowedUpdates = ['isPrivate', 'description', 'webhooks', 'payloadSchema'];
+    const allowedUpdates = new Set(['isPrivate', 'description', 'webhooks', 'payloadSchema']);
     const actualUpdates = {};
     
     Object.keys(updates).forEach(key => {
-      if (allowedUpdates.includes(key)) {
+      if (allowedUpdates.has(key)) {
         actualUpdates[key] = updates[key];
       }
     });
@@ -233,7 +286,6 @@ export default async function (fastify) {
         return reply.status(404).send({ error: 'Topic not found or access denied' });
       }
 
-      const { nanoid } = await import('nanoid');
       const keyValue = `bt_${nanoid(32)}`;
 
       const { rows } = await pool.query(
@@ -454,6 +506,55 @@ export default async function (fastify) {
     }
   });
 
+  const authenticatePublishRequest = async (request, topicName, ownerId, username) => {
+    if (!(request.headers?.authorization || request.query?.token || request.query?.apiKey)) {
+      return;
+    }
+
+    try {
+      await request.jwtVerify();
+      return;
+    } catch (err) {
+      request.log.debug(`JWT verification failed (falling back to API key): ${err.message}`);
+    }
+
+    const apiKey = extractApiKey(request);
+    if (!apiKey) return;
+
+    if (apiKey.startsWith('bc_')) {
+      const dbUser = await User.findOne({ apiKey });
+      if (dbUser) {
+        request.user = { id: dbUser._id.toString(), username: dbUser.username };
+      }
+    } else if (apiKey.startsWith('bt_')) {
+      const topicAuth = await verifyTopicKeyForPublish(apiKey, topicName, ownerId);
+      if (topicAuth) {
+        request.user = { id: ownerId, username, topicAuth };
+      }
+    }
+  };
+
+  const getOrCreateTopicForPublish = async (request, reply, user, topicName) => {
+    const { rows } = await pool.query(
+      'SELECT id, name, owner_id AS "owner", is_private AS "isPrivate", description, webhooks, payload_schema AS "payloadSchema", authorized_users AS "authorizedUsers" FROM topics WHERE name = $1 AND owner_id = $2',
+      [topicName, user._id.toString()]
+    );
+    let topic = rows[0];
+
+    if (!topic) {
+      const isOwner = request.user?.id === user._id.toString() && !request.user?.topicAuth;
+      if (isOwner) {
+        const { rows: newTopicRows } = await pool.query(
+          'INSERT INTO topics (name, owner_id, is_private, description) VALUES ($1, $2, $3, $4) RETURNING id, name, owner_id AS "owner", is_private AS "isPrivate", description, webhooks, payload_schema AS "payloadSchema", authorized_users AS "authorizedUsers"',
+          [topicName, user._id.toString(), true, 'Automatically provisioned endpoint']
+        );
+        topic = newTopicRows[0];
+        fastify.log.info(`Topic /${user.username}/${topicName} automatically provisioned.`);
+      }
+    }
+    return topic;
+  };
+
   /**
    * Publisher endpoint
    * POST /:username/:topic
@@ -462,115 +563,42 @@ export default async function (fastify) {
     const { username, topic: topicName } = request.params;
     const payload = request.body;
 
-    const user = await User.findOne({ username });
-    if (!user) {
-      return reply.status(404).send({ error: 'User not found' });
-    }
-
-    // Try to authenticate if auth credentials are provided
-    if (request.headers.authorization || request.query.token || request.query.apiKey) {
-      try {
-        await request.jwtVerify();
-      } catch (_) {
-        // If JWT fails, check for API key
-        const authHeader = request.headers.authorization;
-        let apiKey = request.query.token || request.query.apiKey;
-
-        if (authHeader && authHeader.startsWith('Bearer ')) {
-          const potentialKey = authHeader.split(' ')[1];
-          if (potentialKey.startsWith('bc_') || potentialKey.startsWith('bt_')) {
-            apiKey = potentialKey;
-          }
-        }
-
-        if (apiKey) {
-          if (apiKey.startsWith('bc_')) {
-            const dbUser = await User.findOne({ apiKey });
-            if (dbUser) {
-              request.user = { id: dbUser._id.toString(), username: dbUser.username };
-            }
-          } else if (apiKey.startsWith('bt_')) {
-            const { rows } = await pool.query(
-              `SELECT tk.id, tk.permission, t.id AS topic_id
-               FROM topic_api_keys tk
-               JOIN topics t ON tk.topic_id = t.id
-               WHERE tk.key_value = $1 AND t.name = $2 AND t.owner_id = $3`,
-              [apiKey, topicName, user._id.toString()]
-            );
-            const keyInfo = rows[0];
-            if (keyInfo) {
-              const isAllowed = keyInfo.permission === 'all' || keyInfo.permission === 'publish';
-              if (isAllowed) {
-                request.user = { 
-                  id: user._id.toString(), 
-                  username: user.username,
-                  topicAuth: {
-                    topicId: keyInfo.topic_id,
-                    permission: keyInfo.permission
-                  }
-                };
-              }
-            }
-          }
-        }
+    try {
+      const user = await User.findOne({ username });
+      if (!user) {
+        return reply.status(404).send({ error: 'User not found' });
       }
-    }
 
-    let { rows } = await pool.query(
-      'SELECT id, name, owner_id AS "owner", is_private AS "isPrivate", description, webhooks, payload_schema AS "payloadSchema", authorized_users AS "authorizedUsers" FROM topics WHERE name = $1 AND owner_id = $2',
-      [topicName, user._id.toString()]
-    );
-    let topic = rows[0];
+      await authenticatePublishRequest(request, topicName, user._id.toString(), user.username);
 
-    // Auto-create topic if it does not exist, but only if request is authenticated as owner
-    if (!topic) {
-      const isOwner = request.user && request.user.id === user._id.toString() && !request.user.topicAuth;
-      if (isOwner) {
-        try {
-          const { rows: newTopicRows } = await pool.query(
-            'INSERT INTO topics (name, owner_id, is_private, description) VALUES ($1, $2, $3, $4) RETURNING id, name, owner_id AS "owner", is_private AS "isPrivate", description, webhooks, payload_schema AS "payloadSchema", authorized_users AS "authorizedUsers"',
-            [topicName, user._id.toString(), true, 'Automatically provisioned endpoint']
-          );
-          topic = newTopicRows[0];
-          fastify.log.info(`Topic /${username}/${topicName} automatically provisioned.`);
-        } catch (err) {
-          fastify.log.error(err);
-          return reply.status(500).send({ error: 'Failed to auto-create topic' });
-        }
-      } else {
+      const topic = await getOrCreateTopicForPublish(request, reply, user, topicName);
+      if (!topic) {
         return reply.status(404).send({ error: 'Topic not found' });
       }
-    }
 
-    // Check if the requester is authorized only if the topic is private
-    if (topic.isPrivate) {
-      if (!request.user) {
-        await fastify.authenticate(request, reply);
+      if (topic.isPrivate) {
+        const hasAccess = await checkPrivateAccess(
+          topic,
+          request,
+          reply,
+          user._id.toString(),
+          'Only the topic owner or authorized users can publish'
+        );
+        if (!hasAccess || reply.sent) return;
       }
-      if (reply.sent) return;
 
-      const isOwner = request.user.id === user._id.toString();
-      const isAuthorized = topic.authorizedUsers ? topic.authorizedUsers.some(uId => uId === request.user.id) : false;
-      const isTopicKeyAuth = request.user.topicAuth && request.user.topicAuth.topicId === topic.id;
-
-      if (!isOwner && !isAuthorized && !isTopicKeyAuth) {
-        return reply.status(403).send({ error: 'Only the topic owner or authorized users can publish' });
+      // Payload Validation
+      if (topic.payloadSchema) {
+        const validate = getValidator(topic.payloadSchema);
+        const valid = validate(payload);
+        if (!valid) {
+          return reply.status(400).send({ 
+            error: 'Payload does not match topic schema', 
+            details: validate.errors 
+          });
+        }
       }
-    }
 
-    // Payload Validation
-    if (topic.payloadSchema) {
-      const validate = ajv.compile(topic.payloadSchema);
-      const valid = validate(payload);
-      if (!valid) {
-        return reply.status(400).send({ 
-          error: 'Payload does not match topic schema', 
-          details: validate.errors 
-        });
-      }
-    }
-
-    try {
       // Save message to database
       const { rows } = await pool.query(
         'INSERT INTO messages (topic_id, payload) VALUES ($1, $2) RETURNING id',

@@ -1,4 +1,4 @@
-import { EventEmitter } from 'events';
+import { EventEmitter } from 'node:events';
 import Redis from 'ioredis';
 import dotenv from 'dotenv';
 
@@ -24,6 +24,8 @@ class Broker extends EventEmitter {
           const data = JSON.parse(message);
           super.emit(channel, data);
         } catch (err) {
+          // Fallback to raw message string if it is not valid JSON
+          console.debug(`Broker: Message is not valid JSON, emitting as raw string: ${err.message}`);
           super.emit(channel, message);
         }
       });

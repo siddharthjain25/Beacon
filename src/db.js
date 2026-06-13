@@ -52,9 +52,15 @@ export async function initDb() {
         topic_id INT REFERENCES topics(id) ON DELETE CASCADE,
         name VARCHAR(100) NOT NULL,
         key_value VARCHAR(100) UNIQUE NOT NULL,
+        display_value VARCHAR(50),
         permission VARCHAR(20) DEFAULT 'publish',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
+    `);
+
+    // Ensure display_value column exists for backward compatibility with existing databases
+    await client.query(`
+      ALTER TABLE topic_api_keys ADD COLUMN IF NOT EXISTS display_value VARCHAR(50)
     `);
 
     // Create indexes for faster queries
@@ -86,6 +92,12 @@ export async function initDb() {
       CREATE INDEX IF NOT EXISTS idx_webhook_logs_topic
       ON webhook_logs(topic_id, created_at DESC)
     `);
+
+    // Enable Row Level Security (RLS) on all tables to resolve database linter issues
+    await client.query('ALTER TABLE topics ENABLE ROW LEVEL SECURITY');
+    await client.query('ALTER TABLE messages ENABLE ROW LEVEL SECURITY');
+    await client.query('ALTER TABLE topic_api_keys ENABLE ROW LEVEL SECURITY');
+    await client.query('ALTER TABLE webhook_logs ENABLE ROW LEVEL SECURITY');
 
     await client.query('COMMIT');
     console.log('Postgres tables initialized successfully');

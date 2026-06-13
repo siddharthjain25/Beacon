@@ -156,6 +156,28 @@ const verifyTopicApiKey = async (apiKey, request) => {
   };
 };
 
+const verifyApiKeyAndSetUser = async (apiKey, request) => {
+  if (apiKey.startsWith('bc_')) {
+    const hashedKey = hashKey(apiKey);
+    let user = await User.findOne({ apiKeyHash: hashedKey });
+    if (!user) {
+      // Upgrade path for legacy plaintext key users
+      user = await User.findOne({ apiKey: apiKey });
+      if (user) {
+        user.apiKeyHash = hashedKey;
+        user.apiKeyDisplay = maskKey(apiKey);
+        await user.save();
+      }
+    }
+    if (user) {
+      return { id: user._id.toString(), username: user.username };
+    }
+  } else if (apiKey.startsWith('bt_')) {
+    return await verifyTopicApiKey(apiKey, request);
+  }
+  return null;
+};
+
 // Authentication decorator
 fastify.decorate('authenticate', async (request, reply) => {
   // Try JWT first
@@ -168,28 +190,10 @@ fastify.decorate('authenticate', async (request, reply) => {
 
   const apiKey = extractApiKey(request);
   if (apiKey) {
-    if (apiKey.startsWith('bc_')) {
-      const hashedKey = hashKey(apiKey);
-      let user = await User.findOne({ apiKeyHash: hashedKey });
-      if (!user) {
-        // Upgrade path for legacy plaintext key users
-        user = await User.findOne({ apiKey: apiKey });
-        if (user) {
-          user.apiKeyHash = hashedKey;
-          user.apiKeyDisplay = maskKey(apiKey);
-          await user.save();
-        }
-      }
-      if (user) {
-        request.user = { id: user._id.toString(), username: user.username };
-        return;
-      }
-    } else if (apiKey.startsWith('bt_')) {
-      const topicUser = await verifyTopicApiKey(apiKey, request);
-      if (topicUser) {
-        request.user = topicUser;
-        return;
-      }
+    const user = await verifyApiKeyAndSetUser(apiKey, request);
+    if (user) {
+      request.user = user;
+      return;
     }
   }
 

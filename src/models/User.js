@@ -50,15 +50,11 @@ userSchema.pre('save', async function () {
     this.password = await bcrypt.hash(this.password, salt);
   }
 
-  // Hash the API key if it's set/modified, and clear the plaintext field
-  if (this.isModified('apiKey') && this.apiKey) {
+  // Hash the API key if we have a plaintext apiKey and (it was modified or we don't have a hash yet)
+  if (this.apiKey && (this.isModified('apiKey') || !this.apiKeyHash)) {
     this.apiKeyHash = hashKey(this.apiKey);
     this.apiKeyDisplay = maskKey(this.apiKey);
     this.apiKey = undefined; // Prevent plaintext storage
-  } else if (!this.apiKeyHash && this.apiKey) {
-    this.apiKeyHash = hashKey(this.apiKey);
-    this.apiKeyDisplay = maskKey(this.apiKey);
-    this.apiKey = undefined;
   }
 });
 

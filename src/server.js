@@ -204,13 +204,13 @@ fastify.register(cors, {
 
 // Redirect root / to frontend UI
 fastify.get('/', async (request, reply) => {
-  const frontendUrl = process.env.FRONTEND_URL || 'https://beacon-ui.vercel.app';
+  const frontendUrl = process.env.FRONTEND_URL || 'https://beaconop-ui.vercel.app';
   return reply.redirect(frontendUrl);
 });
 
 // Redirect GET /login to frontend UI with callback and other query parameters preserved
 fastify.get('/login', async (request, reply) => {
-  const frontendUrl = process.env.FRONTEND_URL || 'https://beacon-ui.vercel.app';
+  const frontendUrl = process.env.FRONTEND_URL || 'https://beaconop-ui.vercel.app';
   const queryParams = new URLSearchParams(request.query).toString();
   const targetUrl = queryParams ? `${frontendUrl}/?${queryParams}` : frontendUrl;
   return reply.redirect(targetUrl);

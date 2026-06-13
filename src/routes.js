@@ -1,4 +1,5 @@
 import broker from './broker.js';
+import { hashKey, maskKey } from './crypto.js';
 import User from './models/User.js';
 import { pool } from './db.js';
 import { queueWebhookDispatch } from './webhooks.js';
@@ -32,12 +33,13 @@ const extractApiKey = (request) => {
 };
 
 const verifyTopicKeyForPublish = async (apiKey, topicName, ownerId) => {
+  const hashedKey = hashKey(apiKey);
   const { rows } = await pool.query(
     `SELECT tk.id, tk.permission, t.id AS topic_id
      FROM topic_api_keys tk
      JOIN topics t ON tk.topic_id = t.id
      WHERE tk.key_value = $1 AND t.name = $2 AND t.owner_id = $3`,
-    [apiKey, topicName, ownerId]
+    [hashedKey, topicName, ownerId]
   );
   const keyInfo = rows[0];
   if (!keyInfo) return null;
@@ -287,13 +289,20 @@ export default async function beaconRoutes(fastify) {
       }
 
       const keyValue = `bt_${nanoid(32)}`;
+      const keyHash = hashKey(keyValue);
+      const displayValue = maskKey(keyValue);
 
       const { rows } = await pool.query(
-        'INSERT INTO topic_api_keys (topic_id, name, key_value, permission) VALUES ($1, $2, $3, $4) RETURNING id, name, key_value AS "keyValue", permission, created_at AS "createdAt"',
-        [id, name, keyValue, permission]
+        'INSERT INTO topic_api_keys (topic_id, name, key_value, display_value, permission) VALUES ($1, $2, $3, $4, $5) RETURNING id, name, permission, created_at AS "createdAt"',
+        [id, name, keyHash, displayValue, permission]
       );
 
-      return rows[0];
+      // Return the raw key value upon creation once so the user can copy it
+      return {
+        ...rows[0],
+        keyValue,
+        displayValue
+      };
     } catch (err) {
       fastify.log.error(err);
       return reply.status(500).send({ error: 'Failed to create topic key' });
@@ -317,18 +326,23 @@ export default async function beaconRoutes(fastify) {
         return reply.status(404).send({ error: 'Topic not found or access denied' });
       }
 
+      // Return display_value directly as keyValue (already masked)
       const { rows } = await pool.query(
-        'SELECT id, name, key_value AS "keyValue", permission, created_at AS "createdAt" FROM topic_api_keys WHERE topic_id = $1 ORDER BY created_at DESC',
+        'SELECT id, name, display_value AS "keyValue", key_value, permission, created_at AS "createdAt" FROM topic_api_keys WHERE topic_id = $1 ORDER BY created_at DESC',
         [id]
       );
 
-      // Mask key value except for first and last few characters for security
-      const maskedKeys = rows.map(k => ({
-        ...k,
-        keyValue: `${k.keyValue.slice(0, 7)}...${k.keyValue.slice(-4)}`
-      }));
+      // If legacy keys exist without a display_value, fallback to masking their key_value
+      const processedKeys = rows.map(k => {
+        const result = { ...k };
+        if (!result.keyValue && result.key_value) {
+          result.keyValue = `${result.key_value.slice(0, 7)}...${result.key_value.slice(-4)}`;
+        }
+        delete result.key_value; // Remove database hash/legacy value before sending to client
+        return result;
+      });
 
-      return maskedKeys;
+      return processedKeys;
     } catch (err) {
       fastify.log.error(err);
       return reply.status(500).send({ error: 'Failed to fetch topic keys' });

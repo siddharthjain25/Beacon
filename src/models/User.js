@@ -1,6 +1,7 @@
 import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
 import { nanoid } from 'nanoid';
+import { hashKey, maskKey } from '../crypto.js';
 
 const userSchema = new mongoose.Schema({
   username: {
@@ -10,9 +11,16 @@ const userSchema = new mongoose.Schema({
     trim: true,
     lowercase: true,
   },
-  apiKey: {
+  apiKeyHash: {
     type: String,
     unique: true,
+    sparse: true,
+  },
+  apiKeyDisplay: {
+    type: String,
+  },
+  apiKey: {
+    type: String,
     default: () => `bc_${nanoid(32)}`,
   },
   firstName: {
@@ -35,11 +43,23 @@ const userSchema = new mongoose.Schema({
   },
 });
 
-// Hash password before saving
+// Hash password and API key before saving
 userSchema.pre('save', async function () {
-  if (!this.isModified('password')) return;
-  const salt = await bcrypt.genSalt(10);
-  this.password = await bcrypt.hash(this.password, salt);
+  if (this.isModified('password')) {
+    const salt = await bcrypt.genSalt(10);
+    this.password = await bcrypt.hash(this.password, salt);
+  }
+
+  // Hash the API key if it's set/modified, and clear the plaintext field
+  if (this.isModified('apiKey') && this.apiKey) {
+    this.apiKeyHash = hashKey(this.apiKey);
+    this.apiKeyDisplay = maskKey(this.apiKey);
+    this.apiKey = undefined; // Prevent plaintext storage
+  } else if (!this.apiKeyHash && this.apiKey) {
+    this.apiKeyHash = hashKey(this.apiKey);
+    this.apiKeyDisplay = maskKey(this.apiKey);
+    this.apiKey = undefined;
+  }
 });
 
 // Method to compare password

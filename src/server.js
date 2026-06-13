@@ -11,6 +11,7 @@ import authRoutes from './authRoutes.js';
 import User from './models/User.js';
 import { initDb, pool } from './db.js';
 import { createVelicorLogger } from './velicorLogger.js';
+import { hashKey, maskKey } from './crypto.js';
 
 // Load environment variables
 dotenv.config();
@@ -126,12 +127,13 @@ const verifyTopicApiKey = async (apiKey, request) => {
   const user = await User.findOne({ username });
   if (!user) return null;
 
+  const hashedKey = hashKey(apiKey);
   const { rows } = await pool.query(
     `SELECT tk.id, tk.permission, t.id AS topic_id
      FROM topic_api_keys tk
      JOIN topics t ON tk.topic_id = t.id
      WHERE tk.key_value = $1 AND t.name = $2 AND t.owner_id = $3`,
-    [apiKey, topicName, user._id.toString()]
+    [hashedKey, topicName, user._id.toString()]
   );
   const keyInfo = rows[0];
   if (!keyInfo) return null;
@@ -167,7 +169,17 @@ fastify.decorate('authenticate', async (request, reply) => {
   const apiKey = extractApiKey(request);
   if (apiKey) {
     if (apiKey.startsWith('bc_')) {
-      const user = await User.findOne({ apiKey });
+      const hashedKey = hashKey(apiKey);
+      let user = await User.findOne({ apiKeyHash: hashedKey });
+      if (!user) {
+        // Upgrade path for legacy plaintext key users
+        user = await User.findOne({ apiKey: apiKey });
+        if (user) {
+          user.apiKeyHash = hashedKey;
+          user.apiKeyDisplay = maskKey(apiKey);
+          await user.save();
+        }
+      }
       if (user) {
         request.user = { id: user._id.toString(), username: user.username };
         return;
@@ -192,7 +204,16 @@ fastify.register(cors, {
 
 // Redirect root / to frontend UI
 fastify.get('/', async (request, reply) => {
-  return reply.redirect('https://beaconop-ui.vercel.app');
+  const frontendUrl = process.env.FRONTEND_URL || 'https://beacon-ui.vercel.app';
+  return reply.redirect(frontendUrl);
+});
+
+// Redirect GET /login to frontend UI with callback and other query parameters preserved
+fastify.get('/login', async (request, reply) => {
+  const frontendUrl = process.env.FRONTEND_URL || 'https://beacon-ui.vercel.app';
+  const queryParams = new URLSearchParams(request.query).toString();
+  const targetUrl = queryParams ? `${frontendUrl}/?${queryParams}` : frontendUrl;
+  return reply.redirect(targetUrl);
 });
 
 // Register routes

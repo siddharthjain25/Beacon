@@ -125,11 +125,18 @@ async function dispatchSingleWebhook(topicId, messageId, url, payload, attempt =
   if (!success && attempt < MAX_ATTEMPTS) {
     const delay = RETRY_BACKOFF_MS * Math.pow(2, attempt - 1); // 2s, 4s, etc.
     console.log(`Webhook to ${url} failed. Scheduling attempt ${attempt + 1} in ${delay}ms...`);
-    setTimeout(() => {
-      dispatchSingleWebhook(topicId, messageId, url, finalPayload, attempt + 1, existingLogId).catch(err => {
+    if (process.env.VERCEL || process.env.SERVERLESS) {
+      await new Promise(resolve => setTimeout(resolve, delay));
+      await dispatchSingleWebhook(topicId, messageId, url, finalPayload, attempt + 1, existingLogId).catch(err => {
         console.error(`Unhandled error in retried webhook to ${url}:`, err);
       });
-    }, delay);
+    } else {
+      setTimeout(() => {
+        dispatchSingleWebhook(topicId, messageId, url, finalPayload, attempt + 1, existingLogId).catch(err => {
+          console.error(`Unhandled error in retried webhook to ${url}:`, err);
+        });
+      }, delay);
+    }
   }
 }
 
@@ -143,10 +150,21 @@ async function dispatchSingleWebhook(topicId, messageId, url, payload, attempt =
 export async function queueWebhookDispatch(topic, messageId, payload) {
   if (!topic.webhooks || topic.webhooks.length === 0) return;
 
-  // Dispatch all concurrently in the background
-  topic.webhooks.forEach(url => {
-    dispatchSingleWebhook(topic.id, messageId, url, payload, 1).catch(err => {
-      console.error(`Unhandled error dispatching webhook to ${url}:`, err);
+  if (process.env.VERCEL || process.env.SERVERLESS) {
+    // Await all dispatches to prevent serverless function termination
+    await Promise.all(
+      topic.webhooks.map(url =>
+        dispatchSingleWebhook(topic.id, messageId, url, payload, 1).catch(err => {
+          console.error(`Unhandled error dispatching webhook to ${url}:`, err);
+        })
+      )
+    );
+  } else {
+    // Dispatch all concurrently in the background for regular servers
+    topic.webhooks.forEach(url => {
+      dispatchSingleWebhook(topic.id, messageId, url, payload, 1).catch(err => {
+        console.error(`Unhandled error dispatching webhook to ${url}:`, err);
+      });
     });
-  });
+  }
 }

@@ -34,14 +34,36 @@ const extractApiKey = (request) => {
 
 const verifyTopicKeyForPublish = async (apiKey, topicName, ownerId) => {
   const hashedKey = hashKey(apiKey);
-  const { rows } = await pool.query(
+  let { rows } = await pool.query(
     `SELECT tk.id, tk.permission, t.id AS topic_id
      FROM topic_api_keys tk
      JOIN topics t ON tk.topic_id = t.id
      WHERE tk.key_value = $1 AND t.name = $2 AND t.owner_id = $3`,
     [hashedKey, topicName, ownerId]
   );
-  const keyInfo = rows[0];
+  let keyInfo = rows[0];
+
+  if (!keyInfo) {
+    // Legacy fallback: check for plaintext api key
+    const { rows: plaintextRows } = await pool.query(
+      `SELECT tk.id, tk.permission, t.id AS topic_id
+       FROM topic_api_keys tk
+       JOIN topics t ON tk.topic_id = t.id
+       WHERE tk.key_value = $1 AND t.name = $2 AND t.owner_id = $3`,
+      [apiKey, topicName, ownerId]
+    );
+    keyInfo = plaintextRows[0];
+    if (keyInfo) {
+      // Upgrade path: hash the plaintext key in the database
+      const displayValue = maskKey(apiKey);
+      await pool.query(
+        `UPDATE topic_api_keys SET key_value = $1, display_value = $2 WHERE id = $3`,
+        [hashedKey, displayValue, keyInfo.id]
+      );
+      console.log(`Upgraded legacy topic API key id ${keyInfo.id} to hashed value.`);
+    }
+  }
+
   if (!keyInfo) return null;
 
   const isAllowed = keyInfo.permission === 'all' || keyInfo.permission === 'publish';

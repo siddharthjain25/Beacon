@@ -17,11 +17,22 @@ const RETRY_BACKOFF_MS = 2000; // 2 seconds base delay
  */
 function prepareWebhookPayload(url, payload) {
   const isSlackCompatible = url.includes('/hooks.slack.com') || url.endsWith('/slack');
-  if (isSlackCompatible && typeof payload === 'object' && !payload?.text && payload?.message) {
-    return {
-      ...payload,
-      text: payload.message
-    };
+  if (isSlackCompatible && typeof payload === 'object' && !payload?.text) {
+    if (payload.message) {
+      return {
+        ...payload,
+        text: payload.message
+      };
+    }
+    if (payload.event === 'log_retention') {
+      const policyStr = payload.retention_minutes >= 1440 && payload.retention_minutes % 1440 === 0
+        ? `${payload.retention_minutes / 1440} days`
+        : `${payload.retention_minutes} minutes`;
+      return {
+        ...payload,
+        text: `🧹 *Velicor Retention*: Purged ${payload.deleted_count.toLocaleString()} logs for service \`${payload.service}\` (older than ${policyStr})`
+      };
+    }
   }
   return payload;
 }

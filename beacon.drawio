@@ -13,7 +13,7 @@
         <mxCell id="beacon-subscriber" parent="1" style="rounded=1;whiteSpace=wrap;html=1;strokeWidth=2;fontSize=14;fontStyle=1;fillColor=#e7f5ff;strokeColor=#1c7ed6;fontColor=#0b7285;" value="Web UI Console (React/Vite)&lt;br/&gt;- Topic &amp;amp; Webhook Registry&lt;br/&gt;- Real-time stream analytics&lt;br/&gt;- API key manager &amp;amp; sandbox" vertex="1">
           <mxGeometry height="100" width="210" x="70" y="700" as="geometry" />
         </mxCell>
-        <mxCell id="beacon-api" parent="1" style="rounded=1;whiteSpace=wrap;html=1;strokeWidth=2;fontSize=14;fontStyle=1;fillColor=#e3fafc;strokeColor=#0c8599;fontColor=#0b7285;" value="Beacon API Server&lt;br/&gt;(Fastify)&lt;br/&gt;- Rate limiter &amp;amp; Route handlers&lt;br/&gt;- JWT / API Key verification&lt;br/&gt;- Schema validation (Ajv)&lt;br/&gt;- Velicor logger integration" vertex="1">
+        <mxCell id="beacon-api" parent="1" style="rounded=1;whiteSpace=wrap;html=1;strokeWidth=2;fontSize=14;fontStyle=1;fillColor=#e3fafc;strokeColor=#0c8599;fontColor=#0b7285;" value="Beacon API Server&lt;br/&gt;(Fastify)&lt;br/&gt;- Rate limiter &amp;amp; Route handlers&lt;br/&gt;- JWT (7d Expiry) / API Key verification&lt;br/&gt;- Schema validation (Ajv)&lt;br/&gt;- Velicor logger integration" vertex="1">
           <mxGeometry height="130" width="240" x="390" y="390" as="geometry" />
         </mxCell>
         <mxCell id="beacon-mongodb" parent="1" style="shape=cylinder;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;strokeWidth=2;fontSize=14;fontStyle=1;fillColor=#ebfbee;strokeColor=#2b8a3e;fontColor=#2b8a3e;" value="MongoDB&lt;br/&gt;- User credentials&lt;br/&gt;- API key displays &amp;amp; hashes" vertex="1">

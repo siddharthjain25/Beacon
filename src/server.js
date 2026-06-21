@@ -101,7 +101,7 @@ fastify.register(websocket);
 fastify.register(jwt, {
   secret: process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex'),
   sign: {
-    expiresIn: '100y', // Effectively never expires
+    expiresIn: '7d', // Session expires in 7 days
   },
 });
 
